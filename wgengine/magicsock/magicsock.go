@@ -9,6 +9,7 @@ package magicsock
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -31,8 +32,8 @@ import (
 type Conn struct {
 	pconn         *RebindingUDPConn
 	pconnPort     uint16
+	privateKey    key.Private
 	stunServers   []string
-	derpServer    string
 	startEpUpdate chan struct{} // send to trigger endpoint update
 	epFunc        func(endpoints []string)
 	logf          func(format string, args ...interface{})
@@ -58,8 +59,8 @@ type Conn struct {
 	// Its Loaded value is always non-nil.
 	stunReceiveFunc atomic.Value // of func(p []byte, fromAddr *net.UDPAddr)
 
-	derpMu sync.Mutex
-	derp   *derphttp.Client
+	derpMu   sync.Mutex
+	derpConn map[int]*derphttp.Client // magic derp port (see derpmap.go) to its client
 }
 
 // udpAddr is the key in the indexedAddrs map.
@@ -81,8 +82,6 @@ type indexedAddrSet struct {
 // The current default (zero) means to auto-select a random free port.
 const DefaultPort = 0
 
-const DefaultDERP = "https://derp.tailscale.com/derp"
-
 var DefaultSTUN = []string{
 	"stun.l.google.com:19302",
 	"stun3.l.google.com:19302",
@@ -95,7 +94,6 @@ type Options struct {
 	Port uint16
 
 	STUN []string
-	DERP string
 
 	// EndpointsFunc optionally provides a func to be called when
 	// endpoints change. The called func does not own the slice.
@@ -137,7 +135,6 @@ func Listen(opts Options) (*Conn, error) {
 	c := &Conn{
 		pconn:          new(RebindingUDPConn),
 		stunServers:    append([]string{}, opts.STUN...),
-		derpServer:     opts.DERP,
 		startEpUpdate:  make(chan struct{}, 1),
 		epUpdateCtx:    epUpdateCtx,
 		epUpdateCancel: epUpdateCancel,
@@ -355,55 +352,119 @@ func (c *Conn) LocalPort() uint16 {
 	return uint16(laddr.Port)
 }
 
-func (c *Conn) Send(b []byte, ep device.Endpoint) error {
-	a := ep.(*AddrSet)
-
+func shouldSprayPacket(b []byte) bool {
+	if len(b) < 4 {
+		return false
+	}
 	msgType := binary.LittleEndian.Uint32(b[:4])
 	switch msgType {
-	case device.MessageInitiationType, device.MessageResponseType, device.MessageCookieReplyType:
-		// Part of the wireguard handshake.
-		// Send to every potential endpoint we have for a peer.
-		a.mu.Lock()
-		roamAddr := a.roamAddr
-		a.mu.Unlock()
+	case device.MessageInitiationType,
+		device.MessageResponseType,
+		device.MessageCookieReplyType: // TODO: necessary?
+		return true
+	}
+	return false
+}
 
-		var err error
-		var success bool
-		if roamAddr != nil {
-			_, err = c.pconn.WriteTo(b, roamAddr)
-			if err == nil {
-				success = true
-			}
-		}
-		for i := len(a.addrs) - 1; i >= 0; i-- {
-			addr := &a.addrs[i]
-			_, err = c.pconn.WriteTo(b, addr)
-			if err == nil {
-				success = true
-			}
-		}
+var errNoDestinations = errors.New("magicsock: no destinations")
 
-		if msgType == device.MessageInitiationType {
-			// Send initial handshake messages via DERP.
-			c.derpMu.Lock()
-			derp := c.derp
-			c.derpMu.Unlock()
+func (c *Conn) Send(b []byte, ep device.Endpoint) error {
+	spray := shouldSprayPacket(b)
 
-			if derp != nil {
-				if err := derp.Send(a.publicKey, b); err != nil {
-					log.Printf("derp send failed: %v", err)
-				}
-			}
-		}
-
-		if success {
-			return nil
+	a := ep.(*AddrSet)
+	var roamAddr *net.UDPAddr
+	a.mu.Lock()
+	dsts := make([]*net.UDPAddr, 0, 3)
+	roamAddr = a.roamAddr
+	if roamAddr != nil {
+		dsts = append(dsts, roamAddr)
+	}
+	for i := len(a.addrs) - 1; i >= 0; i-- {
+		addr := &a.addrs[i]
+		if spray || a.curAddr == -1 || a.curAddr != i {
+			dsts = append(dsts, addr)
 		}
 	}
+	a.mu.Unlock()
 
-	// Write to the highest-priority address we have seen so far.
-	_, err := c.pconn.WriteTo(b, a.dst())
+	if len(dsts) == 0 {
+		return errNoDestinations
+	}
+
+	var success bool
+	var ret error
+	for _, addr := range dsts {
+		err := c.sendAddr(addr, a.publicKey, b)
+		if err == nil {
+			success = true
+		} else if ret == nil {
+			ret = err
+		}
+		if err != nil && addr != roamAddr {
+			log.Printf("magicsock: Conn.Send(%v): %v", addr, err)
+		}
+	}
+	if success {
+		return nil
+	}
+	return ret
+}
+
+func (c *Conn) sendAddr(addr *net.UDPAddr, pubKey key.Public, b []byte) error {
+	if derp := c.derpClientOfAddr(addr); derp != nil {
+		err := derp.Send(pubKey, b)
+		log.Printf("magicsock: derp.Send(%v): %v", addr, err)
+		return err
+	}
+	_, err := c.pconn.WriteTo(b, addr)
 	return err
+}
+
+func (c *Conn) derpClientOfAddr(addr *net.UDPAddr) *derphttp.Client {
+	if !addr.IP.Equal(derpMagicIP) {
+		return nil
+	}
+	c.derpMu.Lock()
+	defer c.derpMu.Unlock()
+	dc, ok := c.derpConn[addr.Port]
+	if !ok {
+		host := derpHost(addr.Port)
+		var err error
+		dc, err = derphttp.NewClient(c.privateKey, "https://"+host+"/derp", log.Printf)
+		if err != nil {
+			log.Printf("derphttp.NewClient: port %d, host %q invalid? err: %v", addr.Port, host, err)
+			return nil
+		}
+		c.derpConn[addr.Port] = dc
+		go c.runDerpClient(addr, dc)
+	}
+	return dc
+}
+
+func (c *Conn) runDerpClient(derpFakeAddr *net.UDPAddr, dc *derphttp.Client) {
+	var b [64 << 10]byte
+	for {
+		n, err := dc.Recv(b[:])
+		if err != nil {
+			if err == derphttp.ErrClientClosed {
+				return
+			}
+			log.Printf("derp.Recv: %v", err)
+			time.Sleep(250 * time.Millisecond)
+			continue
+		}
+
+		c.reSTUN() // TODO(bradfitz): too aggressive now that DERP is for all packets
+
+		log.Printf("got derp %v packet: %q", derpFakeAddr, b[:n])
+		/*
+			addr := c.pconn.LocalAddr()
+			if _, err := c.pconn.WriteToUDP(b[:n], addr); err != nil {
+				log.Printf("%v", err)
+			}
+		*/
+	}
+
 }
 
 func (c *Conn) findIndexedAddrSet(addr *net.UDPAddr) (addrSet *AddrSet, index int) {
@@ -455,44 +516,7 @@ func (c *Conn) ReceiveIPv6(buff []byte) (int, device.Endpoint, *net.UDPAddr, err
 }
 
 func (c *Conn) SetPrivateKey(privateKey wgcfg.PrivateKey) error {
-	if c.derpServer == "" {
-		return nil
-	}
-
-	derp, err := derphttp.NewClient(key.Private(privateKey), c.derpServer, log.Printf)
-	if err != nil {
-		return err
-	}
-	go func() {
-		var b [64 << 10]byte
-		for {
-			n, err := derp.Recv(b[:])
-			if err != nil {
-				if err == derphttp.ErrClientClosed {
-					return
-				}
-				log.Printf("derp.Recv: %v", err)
-				time.Sleep(250 * time.Millisecond)
-			}
-
-			c.reSTUN()
-
-			addr := c.pconn.LocalAddr()
-			if _, err := c.pconn.WriteToUDP(b[:n], addr); err != nil {
-				log.Printf("%v", err)
-			}
-		}
-	}()
-
-	c.derpMu.Lock()
-	if c.derp != nil {
-		if err := c.derp.Close(); err != nil {
-			log.Printf("derp.Close: %v", err)
-		}
-	}
-	c.derp = derp
-	c.derpMu.Unlock()
-
+	c.privateKey = key.Private(privateKey)
 	return nil
 }
 
@@ -500,6 +524,7 @@ func (c *Conn) SetMark(value uint32) error { return nil }
 
 func (c *Conn) Close() error {
 	c.epUpdateCancel()
+	// TODO: close c.derpConns
 	return c.pconn.Close()
 }
 
@@ -543,8 +568,16 @@ type AddrSet struct {
 	publicKey key.Public    // peer public key used for DERP communication
 	addrs     []net.UDPAddr // ordered priority list provided by wgengine
 
-	mu       sync.Mutex   // guards roamAddr and curAddr
-	roamAddr *net.UDPAddr // peer addr determined from incoming packets
+	mu sync.Mutex // guards roamAddr and curAddr
+
+	// roamAddr is non-nil if/when we receive a correctly signed
+	// WireGuard packet from an unexpected address. If so, we
+	// remember it and send responses there in the future, but
+	// this should hopefully never be used (or at least used
+	// rarely) in the case that all the components of Tailscale
+	// are correctly learning/sharing the network map details.
+	roamAddr *net.UDPAddr
+
 	// curAddr is an index into addrs of the highest-priority
 	// address a valid packet has been received from so far.
 	// If no valid packet from addrs has been received, curAddr is -1.
@@ -641,7 +674,7 @@ func (a *AddrSet) UpdateDst(new *net.UDPAddr) error {
 		a.roamAddr = new
 
 	case a.roamAddr != nil:
-		log.Printf("magicsock: rx %s from known %s (%d), replacs roaming address %s", pk, new, index, a.roamAddr)
+		log.Printf("magicsock: rx %s from known %s (%d), replaces roaming address %s", pk, new, index, a.roamAddr)
 		a.roamAddr = nil
 		a.curAddr = index
 

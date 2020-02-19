@@ -49,9 +49,9 @@ func (c *Config) ToBytes() []byte {
 }
 
 // Save writes the JSON representation of c to stateFile.
-func (c *Config) Save(stateFile string) error {
+func (c *Config) save(stateFile string) error {
 	c.PublicID = c.PrivateID.Public()
-	if err := os.MkdirAll(filepath.Dir(stateFile), 0777); err != nil {
+	if err := os.MkdirAll(filepath.Dir(stateFile), 0750); err != nil {
 		return err
 	}
 	data := c.ToBytes()
@@ -89,13 +89,9 @@ func (l logWriter) Write(buf []byte) (int, error) {
 }
 
 // New returns a new log policy (a logger and its instance ID) for a
-// given collection name. The provided filePrefix is used as a
-// filename prefix for both for the logger's state file, as well as
-// temporary log entries themselves.
-//
-// TODO: the state and the logs locations should perhaps be separated.
-func New(collection, filePrefix string) *Policy {
-	stateFile := filePrefix + ".log.conf"
+// given collection name. The logger persists its state to stateFile,
+// and buffers logs prior to upload in logsDir.
+func New(collection, stateFile, logsDir string) *Policy {
 	var lflags int
 	if terminal.IsTerminal(2) || runtime.GOOS == "windows" {
 		lflags = 0
@@ -134,7 +130,7 @@ func New(collection, filePrefix string) *Policy {
 	}
 	newc.PublicID = newc.PrivateID.Public()
 	if newc != *oldc {
-		if err := newc.Save(stateFile); err != nil {
+		if err := newc.save(stateFile); err != nil {
 			log.Printf("logpolicy.Config.Save: %v\n", err)
 		}
 	}
@@ -155,7 +151,7 @@ func New(collection, filePrefix string) *Policy {
 	// TODO(crawshaw): filePrefix is a place meant to store configuration.
 	//                 OS policies usually have other preferred places to
 	//                 store logs. Use one of them?
-	filchBuf, filchErr := filch.New(filePrefix, filch.Options{})
+	filchBuf, filchErr := filch.New(logsDir, filch.Options{})
 	if filchBuf != nil {
 		c.Buffer = filchBuf
 	}

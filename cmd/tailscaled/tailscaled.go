@@ -46,7 +46,7 @@ func main() {
 	if err != nil {
 		logf("fixConsoleOutput: %v\n", err)
 	}
-	pol := logpolicy.New("tailnode.log.tailscale.io", "tailscaled")
+	pol := logpolicy.New("tailnode.log.tailscale.io", "tailscaled.log.conf", "tailscaled")
 
 	getopt.Parse()
 	if len(getopt.Args()) > 0 {
